@@ -1,0 +1,159 @@
+name: Titan uptime probe
+
+# Read-only reachability checks for the member-facing Titan surfaces.
+#
+# WHY THIS REPO IS PUBLIC, AND THE RULE THAT COMES WITH IT
+# --------------------------------------------------------
+# GitHub bills Actions minutes on PRIVATE repositories only; public repositories get
+# unlimited minutes on standard runners at no cost. On 2026-08-23 the account hit 100%
+# of its 2,000 included minutes with 9 days left in the cycle and every scheduled job
+# in every repo began failing at dispatch. This probe was the single largest consumer —
+# 611 runs, ~31% of the whole account budget — to run six curl commands.
+#
+# It moved here because it needs NO secrets: every URL it touches is public, and it
+# reads rather than writes. That is the entire reason this repo can be public, so it is
+# also the constraint:
+#
+#   *** NEVER add a secret, token, key, or private hostname to this repository. ***
+#
+# Anything needing credentials belongs in the private repo it came from. The weekly
+# data-path check that submits real rows via TITAN_HEALTH_TOKEN deliberately stayed in
+# collinschwartz1-del/titan-vault for exactly this reason.
+#
+# Because minutes are free here, the cadence went back UP rather than down: every 15
+# minutes instead of the 30 it ran at while it was costing money. Minutes are offset
+# off :00/:15/:30/:45 because the round slots are the congested ones GitHub batches and
+# drops — "*/30" only ever delivered 26.6 of its nominal 48 runs a day.
+#
+# The split this preserves: `probe` is read-only, so it cannot see a broken WRITE path.
+# On 7/29 an over-strict INSERT policy silently 401-rejected real member submissions
+# while every page still returned 200. The weekly datapath job in titan-vault is the
+# check that catches that class of bug. Green here does not mean the stack is healthy.
+
+on:
+  schedule:
+    - cron: "3,18,33,48 * * * *"
+    # Monthly keepalive. GitHub disables scheduled workflows in a repo with no commit
+    # activity for 60 days, and nobody has a reason to ever commit here. Without this the
+    # probe would go quiet on its own around late October and stay that way — the exact
+    # "a check that quietly stops running is worse than no check" failure this stack has
+    # already been bitten by once.
+    - cron: "41 6 1 * *"
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # A single dropped connection is not an outage. On 2026-08-15 08:12 UTC the old-domain
+    # step hit `curl: (28)` — a 30s timeout against a host that answers in ~0.5s — and
+    # emailed a failure for a stack that was entirely healthy; it was 1 red run in 40, and
+    # the next scheduled run was green. One-off noise like that trains you to ignore the
+    # alert, which is how a real outage gets missed. Every read-only probe retries
+    # transient errors (timeouts included, hence --retry-all-errors) before failing, so red
+    # means "still down after three tries seconds apart" rather than "one packet went
+    # missing". Per-attempt budget is 20s — ~40x the normal response — and --retry-max-time
+    # stops a new attempt starting after 45s, capping each step near 60s. timeout-minutes
+    # is 10 so that even a total outage across all six steps still ends in a named FAIL
+    # instead of an opaque job timeout.
+    #
+    # $RETRY is deliberately unquoted at each call site so it splits into separate flags.
+    # That is bash behaviour, and bash is already the runner default — the shell is pinned
+    # below so the dependency is explicit rather than inherited. (Under zsh the same line
+    # passes the whole string as one option and curl rejects it, which is what happens if
+    # you test these steps by hand on a Mac.)
+    defaults:
+      run:
+        shell: bash
+    env:
+      RETRY: "--retry 3 --retry-delay 2 --retry-all-errors --retry-max-time 45"
+    steps:
+      - name: Vault serves the real app
+        run: |
+          set -euo pipefail
+          html=$(curl -fsSL --max-time 20 $RETRY https://vault.titanmastermind.org)
+          bundle=$(echo "$html" | grep -oE '/assets/index-[^"]+\.js' | head -1)
+          test -n "$bundle" || { echo "FAIL: no app bundle referenced on vault home"; exit 1; }
+          curl -fsSL --max-time 20 $RETRY -o /tmp/bundle.js "https://vault.titanmastermind.org$bundle"
+          grep -q "Titans Pillar Worksheet" /tmp/bundle.js \
+            || { echo "FAIL: vault bundle missing worksheet marker"; exit 1; }
+          echo "OK: vault serves bundle $bundle with worksheet marker"
+
+      - name: Public worksheet reachable
+        run: |
+          set -euo pipefail
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 $RETRY -L https://vault.titanmastermind.org/worksheet)
+          test "$code" = "200" || { echo "FAIL: /worksheet returned $code"; exit 1; }
+          echo "OK: /worksheet 200"
+
+      - name: Main site links to the vault
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 20 $RETRY -o /tmp/main.html https://titanmastermind.org
+          grep -q 'https://vault.titanmastermind.org' /tmp/main.html \
+            || { echo "FAIL: titanmastermind.org missing vault Member-login link"; exit 1; }
+          echo "OK: main site links to vault"
+
+      - name: Reflections up
+        run: |
+          set -euo pipefail
+          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 $RETRY -L https://reflect.titanmastermind.org/login)
+          test "$code" = "200" || { echo "FAIL: reflect login returned $code"; exit 1; }
+          echo "OK: reflect login 200"
+
+      - name: Old domain redirects to vault
+        run: |
+          set -euo pipefail
+          curl -fsSL --max-time 20 $RETRY -o /tmp/old.html https://titansmastermindvault.com
+          grep -qi 'vault.titanmastermind.org' /tmp/old.html \
+            || { echo "FAIL: titansmastermindvault.com not redirecting to vault"; exit 1; }
+          echo "OK: old domain redirects to vault"
+
+      # Membership applications are the highest-value write path in the Titan stack and
+      # /api/apply is the ONLY capture route for the public form. Deliberately probed with
+      # an INVALID payload: a valid one would insert a real row and fire the Slack + email
+      # "new application" alert on every run. The 422 still proves the apex→www redirect,
+      # the route being deployed, and its validation actually executing — which is what a
+      # bad deploy would break. Whether Supabase is wired behind it is covered separately
+      # by the route's own fail-loud 503 to the applicant.
+      # Retried like the others, but with plain --retry rather than --retry-all-errors: only
+      # connection-level failures get another attempt. The expected 422 is not a curl error
+      # (no -f), so a retry never fires on it. Retrying this POST is safe regardless — the
+      # payload is invalid by design and inserts nothing.
+      - name: Application capture route alive
+        run: |
+          set -euo pipefail
+          code=$(curl -s -L -o /tmp/apply.json -w '%{http_code}' --max-time 20 \
+            --retry 3 --retry-delay 2 --retry-max-time 45 \
+            -X POST https://titanmastermind.org/api/apply \
+            -H 'Content-Type: application/json' \
+            -d '{"full_name":"","email":"","bottleneck":""}')
+          if [ "$code" != "422" ]; then
+            echo "FAIL: /api/apply returned $code on an invalid payload, expected 422"
+            head -c 400 /tmp/apply.json; echo
+            exit 1
+          fi
+          grep -q '"ok":false' /tmp/apply.json \
+            || { echo "FAIL: /api/apply 422 body missing the validation error"; cat /tmp/apply.json; exit 1; }
+          echo "OK: /api/apply deployed and validating"
+
+  # Commits a timestamp once a month purely so the repo counts as active and GitHub does
+  # not auto-disable the schedule above. Exits clean when the file is unchanged.
+  keepalive:
+    if: github.event.schedule == '41 6 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Touch the heartbeat so the schedule stays enabled
+        run: |
+          set -euo pipefail
+          date -u +%Y-%m-%dT%H:%M:%SZ > .keepalive
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          git diff --cached --quiet && { echo "no change"; exit 0; }
+          git commit -m "keepalive: keep the scheduled probe from auto-disabling"
+          git push
