@@ -94,12 +94,38 @@ jobs:
             || { echo "FAIL: titanmastermind.org missing vault Member-login link"; exit 1; }
           echo "OK: main site links to vault"
 
-      - name: Reflections up
+      # Member login is the only way into Reflections, so this step has to prove the PAGE
+      # is really there, not just that something answered. It used to assert %{http_code}
+      # was 200 and nothing else — a status-code check against a Next.js app, which serves
+      # its own not-found page with a 200. A deploy that dropped the /login route would
+      # have read green here indefinitely.
+      #
+      # The assertion is the login shell (`login-wrap`), and it is deliberately not
+      # stricter than that. /login calls useSearchParams, so React bails to client-side
+      # rendering and the server ships that wrapper around an EMPTY Suspense fallback:
+      # `login-wrap` is the last thing in the server HTML that proves the route is in the
+      # build. Do NOT tighten this to the email input or the "Cohort password" text —
+      # neither appears in the server response on a healthy page, so asserting them would
+      # make this step permanently red. Nothing curl can see proves the form hydrated;
+      # that needs a browser, and it is out of scope for a read-only probe.
+      #
+      # The root redirect is checked too, because / is the URL members have bookmarked.
+      # Checked WITHOUT -L so a 307 is observable — following it just lands on /login and
+      # reports 200 whether or not the redirect exists.
+      - name: Reflections login page renders
         run: |
           set -euo pipefail
-          code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 $RETRY -L https://reflect.titanmastermind.org/login)
+          root=$(curl -s -o /dev/null -w '%{http_code}' --max-time 20 $RETRY https://reflect.titanmastermind.org)
+          test "$root" = "307" \
+            || { echo "FAIL: reflect root returned $root, expected a 307 to /login"; exit 1; }
+          code=$(curl -s -o /tmp/login.html -w '%{http_code}' --max-time 20 $RETRY -L https://reflect.titanmastermind.org/login)
           test "$code" = "200" || { echo "FAIL: reflect login returned $code"; exit 1; }
-          echo "OK: reflect login 200"
+          grep -q 'login-wrap' /tmp/login.html || {
+            echo "FAIL: /login answered 200 but served no login shell — route missing from the build"
+            head -c 400 /tmp/login.html; echo
+            exit 1
+          }
+          echo "OK: reflect root 307s and /login serves the login shell"
 
       - name: Old domain redirects to vault
         run: |
